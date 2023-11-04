@@ -29,6 +29,10 @@ type MessageFetcher struct {
 	uids      map[string]uint32
 	params    *MessageFetcherParams
 	settings  *Settings
+
+	stopped     chan error
+	pollContext context.Context
+	pollCancel  context.CancelCauseFunc
 }
 
 func NewMessageFetcher(params *MessageFetcherParams) *MessageFetcher {
@@ -36,15 +40,22 @@ func NewMessageFetcher(params *MessageFetcherParams) *MessageFetcher {
 	imap.CharsetReader = charset.Reader
 
 	return &MessageFetcher{
-		mailboxes: []string{},
-		uids:      make(map[string]uint32),
-		params:    params,
-		settings:  NewSettings(),
+		mailboxes:   []string{},
+		uids:        make(map[string]uint32),
+		params:      params,
+		settings:    NewSettings(),
+		pollContext: context.Background(),
 	}
 
 }
 
 func (mf *MessageFetcher) Poll(ctx context.Context, polling chan bool, stopped chan error) {
+
+	pollContext, pollCancel := context.WithCancelCause(ctx)
+
+	mf.stopped = stopped
+	mf.pollContext = pollContext
+	mf.pollCancel = pollCancel
 
 	if err := mf.dial(ctx); err != nil {
 		mf.settings.logger.Error(err.Error())
@@ -92,11 +103,21 @@ func (mf *MessageFetcher) Poll(ctx context.Context, polling chan bool, stopped c
 
 	var outerError error
 
-	polling <- true
+	go func() {
+		polling <- true
+	}()
 
-	for outerError == nil {
+	shouldStop := false
 
-		<-time.After(5 * time.Second)
+	for !shouldStop {
+
+		select {
+		case <-mf.pollContext.Done():
+			shouldStop = true
+			continue
+		case <-time.After(5 * time.Second):
+			break
+		}
 
 		for mi, m := range mf.mailboxes {
 
@@ -146,6 +167,13 @@ func (mf *MessageFetcher) Poll(ctx context.Context, polling chan bool, stopped c
 
 			for msg := range messages {
 
+				select {
+				case <-mf.pollContext.Done():
+					shouldStop = true
+					continue
+				default:
+				}
+
 				r := msg.GetBody(&section)
 
 				if r == nil {
@@ -174,11 +202,23 @@ func (mf *MessageFetcher) Poll(ctx context.Context, polling chan bool, stopped c
 
 	}
 
-	if outerError != nil {
-		stopped <- outerError
+	select {
+	case <-pollContext.Done():
+		stopped <- nil
+	default:
+
+		if outerError != nil {
+			stopped <- outerError
+		} else {
+			stopped <- nil
+		}
+
 	}
 
-	return
+}
+
+func (mf *MessageFetcher) Stop() {
+	mf.pollCancel(nil)
 }
 
 func (mf *MessageFetcher) SetLogger(logger Logger) {
